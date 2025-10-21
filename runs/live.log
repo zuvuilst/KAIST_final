@@ -1,0 +1,4 @@
+[2025-10-20 05:21:30] [start] pipeline initialized
+[2025-10-20 05:21:31] [subset] max_ids -> 100 complexes
+[2025-10-20 05:21:31] [step 0/8] HGNN embedding check (skipped pre-computation)
+[2025-10-20 05:22:41] [step 1/8] T-RAP Training done

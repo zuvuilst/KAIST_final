@@ -3,7 +3,7 @@ import os
 import torch
 
 # ========= Paths =========
-OUTDIR = os.getenv("APT_OUTDIR", r"C:\KAIST_APT_Trade\out")
+OUTDIR = os.getenv("APT_OUTDIR", r"D:\KAIST\Thesis_Data")
 CACHE_DIR = os.path.join(OUTDIR, "cache")
 os.makedirs(OUTDIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)

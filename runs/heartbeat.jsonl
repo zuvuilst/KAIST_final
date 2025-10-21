@@ -1,0 +1,4 @@
+{"ts": 1760905290.7717998, "step": 0, "total": 8, "tag": "start", "pct": 0.0, "extra": {"remaining_steps": 8, "remaining_pct": 100.0}}
+{"ts": 1760905291.580336, "step": 0, "total": 8, "tag": "T-RAP Training (running)", "pct": 0.0, "extra": {}}
+{"ts": 1760905361.796038, "step": 1, "total": 8, "tag": "t_rap_train_done", "pct": 0.125, "extra": {"remaining_steps": 7, "remaining_pct": 87.5}}
+{"ts": 1760905361.808006, "step": 1, "total": 8, "tag": "NOW pseudo-COLD (running)", "pct": 0.125, "extra": {}}

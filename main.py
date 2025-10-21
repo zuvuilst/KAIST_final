@@ -6,6 +6,7 @@ from typing import Optional, Dict, Tuple, Iterable, List
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import torch
 
 from config import OUTDIR, SEED, T_IN, H_OUT, DEVICE, MIXED_PRECISION
 try:
@@ -18,8 +19,7 @@ from temporal_models import train_temporal, forecast_with_model
 from generator import build_synthetic_context
 from progress_utils import print_step, Heartbeat, render_dashboard, LiveLogger, live_log
 
-# (원본의 하트비트/라이브로그/평가 루틴을 유지하면서 FUTURE 멀티스텝/멀티백본 확장) :contentReference[oaicite:14]{index=14}
-
+# ───────── settings ─────────
 FUT_STEPS = [1,2,3,6,12,18,24,30,36]
 
 # ───────── metrics ─────────
@@ -39,7 +39,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 try: sys.stdout.reconfigure(line_buffering=True)
 except Exception: pass
 
-# ───────── spinner ─────────
+# ───────── lightweight spinner ─────────
 class _Spinner:
     def __init__(self, message: str = "working...", interval: float = 0.2):
         self.message = message; self.interval = interval
@@ -51,7 +51,7 @@ class _Spinner:
             time.sleep(self.interval); i+=1
         sys.stdout.write("\r"+" "*(len(self.message)+4)+"\r"); sys.stdout.flush()
     def __enter__(self): self._stop.clear(); self._t=threading.Thread(target=self._run,daemon=True); self._t.start(); return self
-    def __exit__(self, exc_type, exc, tb): self._stop.set(); 
+    def __exit__(self, exc_type, exc, tb): self._stop.set()
     def join(self): 
         if self._t is not None: self._t.join()
 
@@ -75,7 +75,7 @@ def load_data():
 
 # ───────── embeddings ─────────
 def build_embeddings(master: pd.DataFrame) -> Tuple[List[str], np.ndarray]:
-    X = meta_embed(master)    # HGNN 임베딩 파일이 있으면 우선 사용, 아니면 lat/lon/year 기반. :contentReference[oaicite:15]{index=15}
+    X = meta_embed(master)    # HGNN 임베딩이 있으면 우선 사용, 없으면 메타 임베딩
     ids = master["complex_id"].astype(str).tolist()
     return ids, X
 
@@ -102,6 +102,10 @@ def _series_len_before_after(monthly: pd.DataFrame, cid, cutoff: pd.Timestamp) -
 
 def build_cohorts_at_anchor(monthly: pd.DataFrame, ids: Iterable[str], anchor_now: pd.Timestamp, H: int,
                             warm_min=2, warm_max=10, hot_k=60, include_all_hot_as_pseudo: bool = True):
+    """
+    cutoff = anchor_now - (H-1)개월
+    TRUE(=1), WARM(2~10), HOT(>=hot_k), PSEU(HOT as COLD)
+    """
     cutoff = (anchor_now.to_period("M") - (H-1)).to_timestamp()
     true_cold, warm, hot, all_eval = [], [], [], []
     for cid in ids:
@@ -132,9 +136,13 @@ def make_normal_forecaster(model, scalers: Optional[Dict[str, Tuple[float, float
 
 def make_synthctx_forecaster(model, master: pd.DataFrame, monthly: pd.DataFrame, trades: pd.DataFrame,
                              ids: List[str], X: np.ndarray, T_in: int, H: int, *,
-                             gen_model: str = "econ_level_trend", econ_kwargs: Optional[dict] = None,
+                             gen_model: str = "econ_level_trend", gen_kwargs: Optional[dict] = None,
                              spatial_map: Dict[str,np.ndarray] = None):
-    econ_kwargs = econ_kwargs or {}
+    """
+    gen_model ∈ {"basic","econ_add","econ_level_trend","mean_nosmooth","zero","radiff","csdi"}
+    확산(radiff/csdi)은 generator.py에서 체크포인트/의존성 없으면 자동 폴백(econ_level_trend)
+    """
+    gen_kwargs = gen_kwargs or {}
     spatial_map = spatial_map or {}
     def _forecast(monthly_df: pd.DataFrame, cid: str, months_ctx: pd.DatetimeIndex, H_override: Optional[int]=None) -> np.ndarray:
         H_use = H if H_override is None else H_override
@@ -176,14 +184,26 @@ def make_synthctx_forecaster(model, master: pd.DataFrame, monthly: pd.DataFrame,
         neigh = neigh_raw.copy()
         if "ppsm_median" in neigh.columns:
             neigh["ppsm_median"] = neigh.apply(lambda r: r["ppsm_median"] * scale_map.get(str(r["complex_id"]), 1.0), axis=1)
-        ctx = build_synthetic_context(model=gen_model, target_id=cid, months=months_ctx,
-                                      neigh_monthly=neigh, neigh_ids=ids_kept, hybrid_weights=w_kept, T_in=T_IN,
-                                      monthly_all=monthly, trades_all=trades,
-                                      econ_corr_threshold=econ_kwargs.get("econ_corr_threshold", 0.80),
-                                      econ_alpha_level=econ_kwargs.get("econ_alpha_level", 0.12),
-                                      econ_beta_trend=econ_kwargs.get("econ_beta_trend", 0.20),
-                                      econ_max_lag=econ_kwargs.get("econ_max_lag", 12),
-                                      econ_disable_cache=econ_kwargs.get("econ_disable_cache", True)).astype(np.float32)
+
+        # 합성 컨텍스트 생성
+        ctx = build_synthetic_context(
+            target_id=cid, months=months_ctx, neigh_monthly=neigh, neigh_ids=ids_kept,
+            hybrid_weights=w_kept, T_in=T_IN,
+            gen_model=gen_model,
+            monthly_all=monthly, trades_all=trades,
+            # generator 노브 일괄 전달
+            recency_half_life=gen_kwargs.get("recency_half_life"),
+            econ_corr_threshold=gen_kwargs.get("econ_corr_threshold", 0.80),
+            econ_alpha_level=gen_kwargs.get("econ_alpha_level", 0.12),
+            econ_beta_trend=gen_kwargs.get("econ_beta_trend", 0.20),
+            econ_max_lag=gen_kwargs.get("econ_max_lag", 12),
+            econ_disable_cache=gen_kwargs.get("econ_disable_cache", True),
+            econ_add_strength=gen_kwargs.get("econ_add_strength", 0.25),
+            diffusion_ckpt_radiff=gen_kwargs.get("diff_radiff_ckpt"),
+            diffusion_ckpt_csdi=gen_kwargs.get("diff_csdi_ckpt"),
+            diffusion_device=gen_kwargs.get("diff_device", "cpu"),
+        ).astype(np.float32)
+
         mu, sd = float(np.nanmean(ctx)), float(np.nanstd(ctx)+1e-6)
         sp = spatial_map.get(str(cid))
         return forecast_with_model(monthly_df, cid, months_ctx, model, T_in=T_IN, H=H_use,
@@ -213,6 +233,9 @@ def evaluate_now(monthly: pd.DataFrame, ids: Iterable[str], forecast_fn, months_
 
 def evaluate_future_multi(monthly: pd.DataFrame, ids: Iterable[str], forecast_fn, months_all: pd.DatetimeIndex,
                           anchor: pd.Timestamp, steps: List[int], desc="FUT(multi)"):
+    """
+    FUTURE 평가: 각 h에 대해 컨텍스트 끝을 anchor-h로 두고 h-스텝 예측의 마지막 값을 anchor 실측과 비교
+    """
     sub_anchor = (monthly[["complex_id","ym","ppsm_median"]].drop_duplicates()
                   .pivot(index="ym", columns="complex_id", values="ppsm_median"))
     if anchor not in sub_anchor.index:
@@ -240,7 +263,7 @@ def evaluate_future_multi(monthly: pd.DataFrame, ids: Iterable[str], forecast_fn
 
 # ───────── main run ─────────
 def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_model: str, econ_off: bool,
-             backbones: List[str]):
+             backbones: List[str], gen_knobs: Dict):
     logger = LiveLogger(os.path.join(OUTDIR, "live.log"))
     hb = Heartbeat(os.path.join(OUTDIR, "heartbeat.jsonl"))
     steps = ["Load+Embed+Train", "Prepare forecasters", "Evaluate NOW/FUT", "Save & Dashboard"]
@@ -249,16 +272,16 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
     np.random.seed(seed)
     print(f"[device] DEVICE={DEVICE}, AMP={'ON' if MIXED_PRECISION else 'OFF'}, AMP_DTYPE={AMP_DTYPE}", flush=True)
 
-    # load
+    # 1) load
     logger.section("Loading data"); live_log("start loading", path=os.path.join(OUTDIR, "live.log"), tag="load")
     with _Spinner("loading data..."): master, trades, monthly = load_data()
     print(f"✓ Data loaded | master={len(master):,}, monthly={len(monthly):,}")
 
-    # embeddings
+    # 2) embeddings
     logger.section("Building embeddings"); live_log("start embed", path=os.path.join(OUTDIR, "live.log"), tag="embed")
     with _Spinner("building embeddings..."): ids, X = build_embeddings(master)
 
-    # time axis/anchor
+    # 3) time axis/anchor
     months_all = pd.date_range(monthly["ym"].min(), monthly["ym"].max(), freq="MS")
     anchor_now = pick_anchor_now(months_all, anchor_str); print(f"→ Anchor NOW set to {anchor_now:%Y-%m}")
 
@@ -267,7 +290,7 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
     for i, cid in enumerate(master["complex_id"].astype(str).tolist()):
         sp_map[cid] = X[i]
 
-    # train (multi-backbone)
+    # 4) train (multi-backbone)
     logger.section("Training temporal models"); live_log(f"train backbones={backbones} epochs={epochs}", path=os.path.join(OUTDIR,"live.log"), tag="train")
     ep_bar = tqdm(total=epochs, desc="training(all)", dynamic_ncols=True)
     class _Reporter:
@@ -288,7 +311,7 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
     if ep_bar.n<ep_bar.total: ep_bar.update(ep_bar.total-ep_bar.n); hb.write_sub(ep_bar.total, ep_bar.total, tag="train")
     ep_bar.close()
 
-    # cohorts @anchor
+    # 5) cohorts @anchor
     logger.section("Build cohorts"); live_log(f"anchor={anchor_now:%Y-%m} hot_k={hot_k}", path=os.path.join(OUTDIR,"live.log"), tag="cohort")
     meta = build_cohorts_at_anchor(monthly, ids, anchor_now, H_OUT, warm_min=2, warm_max=10, hot_k=hot_k, include_all_hot_as_pseudo=True)
     ids_now = ids_with_obs_at(monthly, meta["all_eval"], anchor_now)
@@ -300,10 +323,9 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
     log_cohort_counts({"anchor_now":anchor_now,"all_eval":all_eval,"true_cold":true_cold,"warm":warm,"hot":hot,"pseudo_cold":pseudo},
                       hot_k, warm_min=2, warm_max=10)
 
-    # forecasters
+    # 6) forecasters
     hb.write_beat(1, len(steps), tag=steps[1]); logger.section("Prepare forecasters")
     gen_used = "basic" if econ_off else (gen_model or "econ_level_trend")
-    econ_kwargs = ({"econ_disable_cache": True} if gen_used.startswith("econ") or gen_used=="diffusion" else {})
 
     rows=[]
     hb.write_beat(2, len(steps), tag=steps[2])
@@ -312,9 +334,9 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
         f_now_norm = make_normal_forecaster(model, scalers, 1, sp_map)
         f_fut_norm = make_normal_forecaster(model, scalers, H_OUT, sp_map)
         f_now_sctx = make_synthctx_forecaster(model, master, monthly, trades, ids, X, T_IN, 1,
-                                              gen_model=gen_used, econ_kwargs=econ_kwargs, spatial_map=sp_map)
+                                              gen_model=gen_used, gen_kwargs=gen_knobs, spatial_map=sp_map)
         f_fut_sctx = make_synthctx_forecaster(model, master, monthly, trades, ids, X, T_IN, H_OUT,
-                                              gen_model=gen_used, econ_kwargs=econ_kwargs, spatial_map=sp_map)
+                                              gen_model=gen_used, gen_kwargs=gen_knobs, spatial_map=sp_map)
 
         # NOW
         res_now_all  = evaluate_now(monthly, all_eval,  f_now_norm, months_all, anchor_now, desc=f"NOW:ALL[{kind}]")
@@ -331,7 +353,7 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
         for h,v in fut_all_norm.items(): push(f"FUT_ALL_NORM_H{h}", v)
         for h,v in fut_all_sctx.items(): push(f"FUT_ALL_SYNTH_H{h}", v)
 
-    # save
+    # 7) save
     hb.write_beat(3, len(steps), tag=steps[3])
     os.makedirs(OUTDIR, exist_ok=True)
     df = pd.DataFrame(rows)
@@ -341,7 +363,7 @@ def run_once(seed: int, epochs: int, hot_k: int, anchor_str: Optional[str], gen_
     print(f"[Saved] {csv_path}")
     live_log(f"saved {os.path.basename(csv_path)}", path=os.path.join(OUTDIR,"live.log"), tag="save")
 
-    # dashboard
+    # 8) dashboard
     try:
         beats = hb.latest(n=50, sub=False)
         dash = render_dashboard(beats, steps=steps, svg_path=os.path.join(OUTDIR, "dashboard.svg"))
@@ -356,15 +378,48 @@ def main():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--hot_k", type=int, default=60)
     ap.add_argument("--anchor_now", type=str, default="2025-05")
+
+    # 합성 컨텍스트 선택 (확산 포함)
     ap.add_argument("--gen_model", type=str, default="econ_level_trend",
-                    choices=["basic","econ_add","econ_level_trend","mean_nosmooth","zero","diffusion"])
-    ap.add_argument("--econ_off", action="store_true")
+                    choices=["basic","econ_add","econ_level_trend","mean_nosmooth","zero","radiff","csdi"],
+                    help="합성 컨텍스트 생성 방식")
+
+    # 경제지표/최근성/확산 노브
+    ap.add_argument("--econ_off", action="store_true", help="경제지표/확산 보정 비활성화(=basic)")
+    ap.add_argument("--recency_half_life", type=int, default=12, help="이웃 최근성 half-life(개월). 0 이하이면 미사용")
+    ap.add_argument("--econ_corr_threshold", type=float, default=0.80)
+    ap.add_argument("--econ_alpha_level", type=float, default=0.12)
+    ap.add_argument("--econ_beta_trend",  type=float, default=0.20)
+    ap.add_argument("--econ_max_lag",     type=int,   default=12)
+    ap.add_argument("--econ_disable_cache", type=int, choices=[0,1], default=1)
+    ap.add_argument("--econ_add_strength", type=float, default=0.25)
+    ap.add_argument("--diff_radiff_ckpt", type=str, default=os.path.join(OUTDIR, "radiff_ckpt.pt"))
+    ap.add_argument("--diff_csdi_ckpt",   type=str, default=os.path.join(OUTDIR, "csdi_ckpt.pt"))
+    ap.add_argument("--diff_device",      type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
+
+    # 백본 멀티 비교
     ap.add_argument("--backbones", type=str, default="gru,lstm,transformer,tcn",
                     help="comma-separated: gru,lstm,transformer,tcn")
     args = ap.parse_args()
+
     backs = [s.strip().lower() for s in args.backbones.split(",") if s.strip()]
+
+    # generator에 전달할 knob 묶음
+    gen_knobs = {
+        "recency_half_life": args.recency_half_life,
+        "econ_corr_threshold": args.econ_corr_threshold,
+        "econ_alpha_level": args.econ_alpha_level,
+        "econ_beta_trend": args.econ_beta_trend,
+        "econ_max_lag": args.econ_max_lag,
+        "econ_disable_cache": bool(args.econ_disable_cache),
+        "econ_add_strength": args.econ_add_strength,
+        "diff_radiff_ckpt": args.diff_radiff_ckpt,
+        "diff_csdi_ckpt": args.diff_csdi_ckpt,
+        "diff_device": args.diff_device,
+    }
+
     run_once(seed=args.seed, epochs=args.epochs, hot_k=args.hot_k, anchor_str=args.anchor_now,
-             gen_model=args.gen_model, econ_off=args.econ_off, backbones=backs)
+             gen_model=args.gen_model, econ_off=args.econ_off, backbones=backs, gen_knobs=gen_knobs)
 
 if __name__ == "__main__":
     main()
